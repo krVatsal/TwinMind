@@ -34,7 +34,8 @@ export default function Home() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
-  const chunkIntervalRef = useRef<number | null>(null);
+  const chunkTimeoutRef = useRef<number | null>(null);
+  const recordingActiveRef = useRef(false);
   const pendingFlushResolversRef = useRef<Array<() => void>>([]);
 
   const transcriptText = useMemo(
@@ -73,7 +74,7 @@ export default function Home() {
       }
 
       const formData = new FormData();
-      formData.append("audio", new File([blob], "chunk.webm", { type: blob.type || "audio/webm" }));
+      formData.append("audio", blob, buildAudioFileName(blob.type));
       formData.append("apiKey", settings.apiKey);
 
       const response = await fetch("/api/transcribe", {
@@ -82,8 +83,16 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        const payload = (await response.json().catch(() => ({}))) as { error?: string };
-        throw new Error(payload.error || "Transcription request failed.");
+        const payload = (await response.json().catch(() => ({}))) as {
+          error?: string;
+          detail?: string;
+          status?: number;
+        };
+        throw new Error(
+          payload.detail ||
+            payload.error ||
+            `Transcription request failed${payload.status ? ` (${payload.status})` : ""}.`,
+        );
       }
 
       const payload = (await response.json()) as { text: string; createdAt: string };
@@ -93,12 +102,16 @@ export default function Home() {
   );
 
   const stopMic = useCallback(() => {
-    if (chunkIntervalRef.current !== null) {
-      window.clearInterval(chunkIntervalRef.current);
-      chunkIntervalRef.current = null;
+    recordingActiveRef.current = false;
+
+    if (chunkTimeoutRef.current !== null) {
+      window.clearTimeout(chunkTimeoutRef.current);
+      chunkTimeoutRef.current = null;
     }
 
-    mediaRecorderRef.current?.stop();
+    if (mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.stop();
+    }
     mediaRecorderRef.current = null;
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
@@ -119,20 +132,30 @@ export default function Home() {
       setTimeout(resolve, 4000);
     });
 
-    recorder.requestData();
+    recorder.stop();
     await Promise.race([chunkProcessed, timeout]);
   }, []);
 
-  const startMic = useCallback(async () => {
-    if (!settings.apiKey.trim()) {
-      setStatusLine("Add Groq API key in settings before recording.");
-      setIsSettingsOpen(true);
-      return;
+  const preferredMimeType = useCallback((): string | undefined => {
+    const candidates = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/ogg",
+    ];
+
+    for (const type of candidates) {
+      if (MediaRecorder.isTypeSupported(type)) {
+        return type;
+      }
     }
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
+    return undefined;
+  }, []);
+
+  function startRecordingCycle(stream: MediaStream) {
+    const mimeType = preferredMimeType();
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
 
       recorder.ondataavailable = (event: BlobEvent) => {
         if (!event.data || event.data.size === 0) {
@@ -159,21 +182,44 @@ export default function Home() {
         setStatusLine("Microphone recording error.");
       };
 
-      recorder.start();
-      chunkIntervalRef.current = window.setInterval(() => {
-        if (recorder.state === "recording") {
-          recorder.requestData();
+      recorder.onstop = () => {
+        if (!recordingActiveRef.current) {
+          return;
         }
-      }, CHUNK_MS);
 
+        // Rotate the recorder so each chunk is a valid standalone media file.
+        startRecordingCycle(stream);
+      };
+
+      recorder.start();
       mediaRecorderRef.current = recorder;
+
+    chunkTimeoutRef.current = window.setTimeout(() => {
+      if (recorder.state === "recording") {
+        recorder.stop();
+      }
+    }, CHUNK_MS);
+  }
+
+  const startMic = async () => {
+    if (!settings.apiKey.trim()) {
+      setStatusLine("Add Groq API key in settings before recording.");
+      setIsSettingsOpen(true);
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
       mediaStreamRef.current = stream;
+      recordingActiveRef.current = true;
+      startRecordingCycle(stream);
       setIsRecording(true);
       setStatusLine("Recording");
     } catch {
       setStatusLine("Mic permission denied or unavailable.");
     }
-  }, [settings.apiKey, transcribeBlob]);
+  };
 
   const refreshSuggestions = useCallback(
     async (source: "auto" | "manual") => {
@@ -712,4 +758,22 @@ function ChatMessageContent({ content }: { content: string }) {
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
     </div>
   );
+}
+
+function buildAudioFileName(mimeType: string): string {
+  const type = mimeType.toLowerCase();
+
+  if (type.includes("ogg")) {
+    return "chunk.ogg";
+  }
+  if (type.includes("mp4") || type.includes("m4a")) {
+    return "chunk.m4a";
+  }
+  if (type.includes("wav")) {
+    return "chunk.wav";
+  }
+  if (type.includes("mpeg") || type.includes("mp3")) {
+    return "chunk.mp3";
+  }
+  return "chunk.webm";
 }
