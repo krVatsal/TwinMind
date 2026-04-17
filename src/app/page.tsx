@@ -1,6 +1,8 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import { DEFAULT_SETTINGS } from "@/lib/defaults";
 import {
@@ -26,11 +28,13 @@ export default function Home() {
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [lastSuggestionLatencyMs, setLastSuggestionLatencyMs] = useState<number | null>(null);
+  const [lastChatFirstTokenLatencyMs, setLastChatFirstTokenLatencyMs] = useState<number | null>(null);
   const [lastChatLatencyMs, setLastChatLatencyMs] = useState<number | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
+  const chunkIntervalRef = useRef<number | null>(null);
   const pendingFlushResolversRef = useRef<Array<() => void>>([]);
 
   const transcriptText = useMemo(
@@ -89,6 +93,11 @@ export default function Home() {
   );
 
   const stopMic = useCallback(() => {
+    if (chunkIntervalRef.current !== null) {
+      window.clearInterval(chunkIntervalRef.current);
+      chunkIntervalRef.current = null;
+    }
+
     mediaRecorderRef.current?.stop();
     mediaRecorderRef.current = null;
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
@@ -123,7 +132,7 @@ export default function Home() {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      const recorder = new MediaRecorder(stream);
 
       recorder.ondataavailable = (event: BlobEvent) => {
         if (!event.data || event.data.size === 0) {
@@ -150,7 +159,13 @@ export default function Home() {
         setStatusLine("Microphone recording error.");
       };
 
-      recorder.start(CHUNK_MS);
+      recorder.start();
+      chunkIntervalRef.current = window.setInterval(() => {
+        if (recorder.state === "recording") {
+          recorder.requestData();
+        }
+      }, CHUNK_MS);
+
       mediaRecorderRef.current = recorder;
       mediaStreamRef.current = stream;
       setIsRecording(true);
@@ -208,7 +223,9 @@ export default function Home() {
           },
           ...prev,
         ]);
-        setLastSuggestionLatencyMs(Math.round(performance.now() - startedAt));
+        const refreshLatency = Math.round(performance.now() - startedAt);
+        setLastSuggestionLatencyMs(refreshLatency);
+        console.info("suggestions_refresh_latency_ms", refreshLatency);
         setStatusLine("Suggestions updated.");
       } catch (error) {
         setStatusLine(error instanceof Error ? error.message : "Failed to update suggestions.");
@@ -258,8 +275,21 @@ export default function Home() {
       setStatusLine("Generating answer...");
 
       const startedAt = performance.now();
+      const assistantMessageId = `${Date.now()}-a`;
+      const assistantCreatedAt = new Date().toISOString();
 
       try {
+        setChatHistory((prev) => [
+          ...prev,
+          {
+            id: assistantMessageId,
+            role: "assistant",
+            content: "",
+            createdAt: assistantCreatedAt,
+            source: "assistant",
+          },
+        ]);
+
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: {
@@ -274,6 +304,7 @@ export default function Home() {
             systemPrompt:
               source === "suggestion" ? settings.expandedAnswerPrompt : settings.chatPrompt,
             userPrompt: prompt,
+            stream: true,
           }),
         });
 
@@ -282,22 +313,63 @@ export default function Home() {
           throw new Error(payload.error || "Chat request failed.");
         }
 
-        const payload = (await response.json()) as { answer: string; createdAt: string };
+        if (!response.body) {
+          throw new Error("Streaming response body was empty.");
+        }
 
-        setChatHistory((prev) => [
-          ...prev,
-          {
-            id: `${Date.now()}-a`,
-            role: "assistant",
-            content: payload.answer,
-            createdAt: payload.createdAt || new Date().toISOString(),
-            source: "assistant",
-          },
-        ]);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let accumulated = "";
+        let hasFirstToken = false;
 
-        setLastChatLatencyMs(Math.round(performance.now() - startedAt));
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+
+          const chunk = decoder.decode(value, { stream: true });
+          if (!chunk) {
+            continue;
+          }
+
+          accumulated += chunk;
+
+          if (!hasFirstToken && chunk.trim()) {
+            hasFirstToken = true;
+            const firstTokenLatency = Math.round(performance.now() - startedAt);
+            setLastChatFirstTokenLatencyMs(firstTokenLatency);
+            console.info("chat_first_token_latency_ms", firstTokenLatency);
+          }
+
+          setChatHistory((prev) =>
+            prev.map((message) =>
+              message.id === assistantMessageId ? { ...message, content: accumulated } : message,
+            ),
+          );
+        }
+
+        if (!accumulated.trim()) {
+          const fallback = "I could not generate a response for that yet.";
+          setChatHistory((prev) =>
+            prev.map((message) =>
+              message.id === assistantMessageId ? { ...message, content: fallback } : message,
+            ),
+          );
+        }
+
+        const totalLatency = Math.round(performance.now() - startedAt);
+        setLastChatLatencyMs(totalLatency);
+        console.info("chat_total_latency_ms", totalLatency);
         setStatusLine("Answer ready.");
       } catch (error) {
+        setChatHistory((prev) =>
+          prev.map((message) =>
+            message.id === assistantMessageId
+              ? { ...message, content: "Failed to generate answer." }
+              : message,
+          ),
+        );
         setStatusLine(error instanceof Error ? error.message : "Failed to generate answer.");
       } finally {
         setIsAnswering(false);
@@ -602,7 +674,7 @@ export default function Home() {
                     <strong>{message.role === "user" ? "You" : "Assistant"}</strong>
                     <span>{formatClock(message.createdAt)}</span>
                   </div>
-                  <p>{message.content}</p>
+                  <ChatMessageContent content={message.content} />
                 </div>
               ))
             )}
@@ -620,7 +692,7 @@ export default function Home() {
           </form>
           <p className="tm-latency">
             {lastChatLatencyMs
-              ? `Last answer latency: ${lastChatLatencyMs}ms`
+              ? `Last chat latency: first token ${lastChatFirstTokenLatencyMs ?? "-"}ms, completed ${lastChatLatencyMs}ms`
               : "No chat answer yet."}
           </p>
         </article>
@@ -632,4 +704,12 @@ export default function Home() {
 function formatClock(iso: string): string {
   const date = new Date(iso);
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function ChatMessageContent({ content }: { content: string }) {
+  return (
+    <div className="tm-msg-content">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    </div>
+  );
 }
