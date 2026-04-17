@@ -31,6 +31,7 @@ export default function Home() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
+  const pendingFlushResolversRef = useRef<Array<() => void>>([]);
 
   const transcriptText = useMemo(
     () => transcript.map((chunk) => `[${formatClock(chunk.createdAt)}] ${chunk.text}`).join("\n"),
@@ -43,18 +44,6 @@ export default function Home() {
     }
     transcriptScrollRef.current.scrollTop = transcriptScrollRef.current.scrollHeight;
   }, [transcript]);
-
-  useEffect(() => {
-    if (!isRecording) {
-      return;
-    }
-
-    const interval = setInterval(() => {
-      void refreshSuggestions("auto");
-    }, Math.max(10, settings.refreshSeconds) * 1000);
-
-    return () => clearInterval(interval);
-  }, [isRecording, settings.refreshSeconds]);
 
   const appendTranscript = useCallback((text: string, createdAt: string) => {
     const cleaned = text.trim();
@@ -108,6 +97,23 @@ export default function Home() {
     setStatusLine("Idle");
   }, []);
 
+  const flushRecordingChunk = useCallback(async () => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state !== "recording") {
+      return;
+    }
+
+    const chunkProcessed = new Promise<void>((resolve) => {
+      pendingFlushResolversRef.current.push(resolve);
+    });
+    const timeout = new Promise<void>((resolve) => {
+      setTimeout(resolve, 4000);
+    });
+
+    recorder.requestData();
+    await Promise.race([chunkProcessed, timeout]);
+  }, []);
+
   const startMic = useCallback(async () => {
     if (!settings.apiKey.trim()) {
       setStatusLine("Add Groq API key in settings before recording.");
@@ -121,6 +127,8 @@ export default function Home() {
 
       recorder.ondataavailable = (event: BlobEvent) => {
         if (!event.data || event.data.size === 0) {
+          const resolver = pendingFlushResolversRef.current.shift();
+          resolver?.();
           return;
         }
 
@@ -131,6 +139,10 @@ export default function Home() {
           })
           .catch((error: unknown) => {
             setStatusLine(error instanceof Error ? error.message : "Transcription error");
+          })
+          .finally(() => {
+            const resolver = pendingFlushResolversRef.current.shift();
+            resolver?.();
           });
       };
 
@@ -160,6 +172,10 @@ export default function Home() {
       setStatusLine(source === "manual" ? "Reloading suggestions..." : "Refreshing suggestions...");
 
       try {
+        if (source === "manual") {
+          await flushRecordingChunk();
+        }
+
         const response = await fetch("/api/suggestions", {
           method: "POST",
           headers: {
@@ -200,8 +216,27 @@ export default function Home() {
         setIsReloading(false);
       }
     },
-    [settings, transcriptText],
+    [
+      flushRecordingChunk,
+      settings.apiKey,
+      settings.liveSuggestionPrompt,
+      settings.suggestionContextChars,
+      settings.suggestionTemperature,
+      transcriptText,
+    ],
   );
+
+  useEffect(() => {
+    if (!isRecording) {
+      return;
+    }
+
+    const interval = setInterval(() => {
+      void refreshSuggestions("auto");
+    }, Math.max(10, settings.refreshSeconds) * 1000);
+
+    return () => clearInterval(interval);
+  }, [isRecording, refreshSuggestions, settings.refreshSeconds]);
 
   const requestDetailedAnswer = useCallback(
     async (userPrompt: string, source: "manual" | "suggestion") => {
@@ -268,7 +303,15 @@ export default function Home() {
         setIsAnswering(false);
       }
     },
-    [settings, transcriptText],
+    [
+      settings.apiKey,
+      settings.answerTemperature,
+      settings.chatContextChars,
+      settings.chatPrompt,
+      settings.expandedAnswerPrompt,
+      settings.expandedContextChars,
+      transcriptText,
+    ],
   );
 
   const onSubmitChat = useCallback(
@@ -383,6 +426,54 @@ export default function Home() {
                     ...prev,
                     expandedContextChars:
                       Number(event.target.value) || prev.expandedContextChars,
+                  }))
+                }
+              />
+            </label>
+            <label>
+              Chat context chars
+              <input
+                type="number"
+                min={500}
+                max={50000}
+                value={settings.chatContextChars}
+                onChange={(event) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    chatContextChars: Number(event.target.value) || prev.chatContextChars,
+                  }))
+                }
+              />
+            </label>
+            <label>
+              Suggestion temperature
+              <input
+                type="number"
+                min={0}
+                max={1.5}
+                step={0.1}
+                value={settings.suggestionTemperature}
+                onChange={(event) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    suggestionTemperature:
+                      Number(event.target.value) || prev.suggestionTemperature,
+                  }))
+                }
+              />
+            </label>
+            <label>
+              Answer temperature
+              <input
+                type="number"
+                min={0}
+                max={1.5}
+                step={0.1}
+                value={settings.answerTemperature}
+                onChange={(event) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    answerTemperature: Number(event.target.value) || prev.answerTemperature,
                   }))
                 }
               />

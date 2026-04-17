@@ -73,43 +73,25 @@ export async function POST(request: Request) {
 
     const context = recentContext(body.transcriptText || "", body.contextChars || 6000);
 
-    const response = await fetch(GROQ_CHAT_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${body.apiKey.trim()}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: CHAT_MODEL,
-        temperature: Number.isFinite(body.temperature) ? body.temperature : 0.3,
-        messages: [
-          {
-            role: "system",
-            content: body.prompt,
-          },
-          {
-            role: "user",
-            content: `Recent transcript context:\n\n${context}`,
-          },
-        ],
+    let suggestions = normalizeSuggestions(
+      await requestSuggestions({
+        apiKey: body.apiKey,
+        prompt: body.prompt,
+        context,
+        temperature: body.temperature,
       }),
-    });
+    );
 
-    if (!response.ok) {
-      const detail = await response.text();
-      return NextResponse.json(
-        { error: "Suggestion generation failed.", detail },
-        { status: response.status },
+    if (suggestions.length !== 3) {
+      suggestions = normalizeSuggestions(
+        await requestSuggestions({
+          apiKey: body.apiKey,
+          prompt: `${body.prompt}\n\nYour previous response was malformed. Retry now with strict JSON only and exactly 3 suggestions.`,
+          context,
+          temperature: body.temperature,
+        }),
       );
     }
-
-    const completion = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-
-    const content = completion.choices?.[0]?.message?.content ?? "";
-
-    let suggestions = normalizeSuggestions(parseJson(content));
 
     if (suggestions.length !== 3) {
       suggestions = fallbackSuggestions(context);
@@ -128,6 +110,46 @@ export async function POST(request: Request) {
       { status: 500 },
     );
   }
+}
+
+async function requestSuggestions(input: {
+  apiKey: string;
+  prompt: string;
+  context: string;
+  temperature: number;
+}): Promise<unknown> {
+  const response = await fetch(GROQ_CHAT_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${input.apiKey.trim()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: CHAT_MODEL,
+      temperature: Number.isFinite(input.temperature) ? input.temperature : 0.3,
+      messages: [
+        {
+          role: "system",
+          content: input.prompt,
+        },
+        {
+          role: "user",
+          content: `Recent transcript context:\n\n${input.context}`,
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`Suggestion generation failed: ${detail}`);
+  }
+
+  const completion = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const content = completion.choices?.[0]?.message?.content ?? "";
+  return parseJson(content);
 }
 
 function parseJson(value: string): unknown {
